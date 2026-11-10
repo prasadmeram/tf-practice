@@ -1,0 +1,17 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+
+  # AWS provider, VPC module and .terraform.lock.hcl
+  - package-ecosystem: terraform
+    directories:
+      - /infra/prod/network
+      - /infra/prod/app
+    schedule:
+      interval: weekly
+    groups:
+      terraform:
+        patterns: ["*"]

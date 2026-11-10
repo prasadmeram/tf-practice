@@ -1,0 +1,215 @@
+name: terraform-pr
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions: {}
+
+env:
+  TF_VERSION: 1.16.4
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+
+jobs:
+  # Plan only the stacks this PR touches (all of them if workflows change).
+  # This is what lets "PR 1 network, then PR 2 app" work: the app plan needs the VPC to exist.
+  changes:
+    name: detect changed stacks
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      stacks: ${{ steps.detect.outputs.stacks }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2 # the PR merge commit and its first parent (the base branch tip)
+          persist-credentials: false
+
+      - id: detect
+        run: |
+          files="$(git diff --name-only HEAD^1 HEAD)"
+          echo "Changed files:"; echo "$files"
+          all=false
+          if grep -qE '^\.github/workflows/' <<<"$files"; then all=true; fi
+          stacks=()
+          for s in network app; do
+            [ -d "infra/prod/$s" ] || continue
+            if $all || grep -q "^infra/prod/$s/" <<<"$files"; then stacks+=("$s"); fi
+          done
+          json="$(printf '%s\n' "${stacks[@]}" | jq -R . | jq -sc 'map(select(length > 0))')"
+          echo "stacks=$json" | tee -a "$GITHUB_OUTPUT"
+
+  stack:
+    name: ${{ matrix.stack }}
+    needs: changes
+    if: needs.changes.outputs.stacks != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
+    strategy:
+      fail-fast: false
+      matrix:
+        stack: ${{ fromJSON(needs.changes.outputs.stacks) }}
+    # One plan per PR per stack; a new push cancels the old plan. Plans run with -lock=false:
+    # the plan role has no write access to the state bucket, and a plan never writes state.
+    concurrency:
+      group: tf-plan-${{ matrix.stack }}-pr-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    defaults:
+      run:
+        working-directory: infra/prod/${{ matrix.stack }}
+    env:
+      STACK: ${{ matrix.stack }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform fmt
+        run: terraform fmt -check -recursive -diff
+
+      - uses: terraform-linters/setup-tflint@6ffdbaa3be476b3431f7275c26966ef32ff60337 # v6.3.2
+        with:
+          tflint_version: v0.66.0
+
+      - name: tflint
+        run: tflint --init && tflint --format compact
+        env:
+          GITHUB_TOKEN: ${{ github.token }} # avoids rate limits downloading the AWS ruleset
+
+      - name: checkov
+        uses: bridgecrewio/checkov-action@45edc9d8856b664db2ec251f5f8632361f0a67aa # v12.3139.0
+        with:
+          directory: infra/prod/${{ matrix.stack }}
+          framework: terraform
+          soft_fail: false
+          quiet: true
+
+      - name: AWS credentials (read-only plan role)
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_PLAN_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gh-pr-plan-${{ matrix.stack }}-${{ github.run_id }}
+
+      - name: terraform init
+        run: terraform init -lockfile=readonly -input=false -no-color
+
+      - name: terraform validate
+        run: terraform validate -no-color
+
+      - name: terraform test
+        if: matrix.stack == 'network'
+        run: terraform test -no-color
+
+      - name: terraform plan
+        id: plan
+        continue-on-error: true # still post the error in the PR comment; failed at the end
+        run: |
+          set -o pipefail
+          terraform plan -no-color -input=false -lock=false -out=tfplan 2>&1 | tee plan.log
+
+      - name: terraform show
+        if: steps.plan.outcome == 'success'
+        run: |
+          terraform show -no-color tfplan > plan.txt
+          terraform show -json tfplan > plan.json
+
+      - name: Build PR comment
+        if: always() && steps.plan.outcome != 'skipped'
+        env:
+          PLAN_OUTCOME: ${{ steps.plan.outcome }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          max=60000 # GitHub's comment limit is 65536 characters
+          {
+            echo "<!-- tf-plan:${STACK} -->"
+            echo "### Terraform plan: \`${STACK}\`"
+            echo
+            if [ "$PLAN_OUTCOME" = "success" ]; then
+              destroys="$(jq -r '.resource_changes[]? | select(.change.actions | index("delete")) | "> - `\(.address)` (\(.change.actions | join(", ")))"' plan.json)"
+              if [ -n "$destroys" ]; then
+                echo "> [!CAUTION]"
+                echo "> This plan **destroys or replaces** these resources:"
+                echo "$destroys"
+                echo
+              fi
+              echo "**$(grep -E '^(Plan:|No changes\.)' plan.txt | head -1 || true)**"
+              src=plan.txt
+            else
+              echo "> [!WARNING]"
+              echo "> **terraform plan failed.** Output below."
+              src=plan.log
+            fi
+            echo
+            echo "<details><summary>Show plan</summary>"
+            echo
+            echo '```text'
+            head -c "$max" "$src"
+            if [ "$(wc -c < "$src")" -gt "$max" ]; then
+              echo; echo "... truncated. Full output: ${RUN_URL}"
+            fi
+            echo '```'
+            echo
+            echo "</details>"
+            echo
+            echo "<sub>Commit ${HEAD_SHA:0:7} · [workflow run](${RUN_URL})</sub>"
+          } > comment.md
+
+      - name: Post or update the sticky PR comment
+        if: always() && steps.plan.outcome != 'skipped'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          COMMENT_FILE: infra/prod/${{ matrix.stack }}/comment.md
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync(process.env.COMMENT_FILE, 'utf8');
+            const marker = `<!-- tf-plan:${process.env.STACK} -->`;
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number, per_page: 100,
+            });
+            const existing = comments.find(
+              (c) => c.user?.type === 'Bot' && c.body?.includes(marker),
+            );
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
+
+      - name: Fail if plan failed
+        if: steps.plan.outcome == 'failure'
+        run: exit 1
+
+  # The ONE required status check in branch protection.
+  checks:
+    name: terraform checks
+    needs: [changes, stack]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - env:
+          CHANGES: ${{ needs.changes.result }}
+          STACK: ${{ needs.stack.result }}
+        run: |
+          echo "changes=$CHANGES stack=$STACK"
+          [ "$CHANGES" = "success" ] || exit 1
+          # skipped = this PR touches no stack (docs-only etc.)
+          case "$STACK" in success|skipped) exit 0 ;; *) exit 1 ;; esac

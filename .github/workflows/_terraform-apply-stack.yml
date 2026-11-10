@@ -1,0 +1,152 @@
+name: _terraform-apply-stack
+
+# Reusable: plan one stack with the read-only role, save the plan, then apply EXACTLY
+# that saved plan with the apply role after a human approves the `prod` environment.
+
+on:
+  workflow_call:
+    inputs:
+      stack:
+        description: Stack directory under infra/prod/
+        required: true
+        type: string
+
+permissions: {}
+
+env:
+  TF_VERSION: 1.16.4
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+
+jobs:
+  plan:
+    name: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        working-directory: infra/prod/${{ inputs.stack }}
+    outputs:
+      has_changes: ${{ steps.plan.outputs.has_changes }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: AWS credentials (read-only plan role)
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_PLAN_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gh-plan-${{ inputs.stack }}-${{ github.run_id }}
+
+      - name: terraform init
+        run: terraform init -lockfile=readonly -input=false -no-color
+
+      - name: terraform plan
+        id: plan
+        run: |
+          set +e
+          terraform plan -no-color -input=false -lock=false -detailed-exitcode -out=tfplan
+          ec=$?
+          set -e
+          case "$ec" in
+            0) echo "has_changes=false" >> "$GITHUB_OUTPUT" ;;
+            2) echo "has_changes=true"  >> "$GITHUB_OUTPUT" ;;
+            *) exit "$ec" ;;
+          esac
+
+      - name: Plan summary
+        env:
+          STACK: ${{ inputs.stack }}
+        run: |
+          terraform show -no-color tfplan > plan.txt
+          terraform show -json tfplan > plan.json
+          max=900000 # step summaries are capped at 1 MiB
+          {
+            echo "### Terraform plan: \`${STACK}\`"
+            echo
+            destroys="$(jq -r '.resource_changes[]? | select(.change.actions | index("delete")) | "> - `\(.address)` (\(.change.actions | join(", ")))"' plan.json)"
+            if [ -n "$destroys" ]; then
+              echo "> [!CAUTION]"
+              echo "> This plan **destroys or replaces** these resources:"
+              echo "$destroys"
+              echo
+            fi
+            echo "**$(grep -E '^(Plan:|No changes\.)' plan.txt | head -1 || true)**"
+            echo
+            echo "<details><summary>Show plan</summary>"
+            echo
+            echo '```text'
+            head -c "$max" plan.txt
+            echo '```'
+            echo
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # NOTE: on a public repo, artifacts are downloadable by other signed-in users.
+      # Another reason nothing secret may ever be in state or plans.
+      - name: Upload saved plan
+        if: steps.plan.outputs.has_changes == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: tfplan-${{ inputs.stack }}
+          path: |
+            infra/prod/${{ inputs.stack }}/tfplan
+            infra/prod/${{ inputs.stack }}/.terraform.lock.hcl
+          include-hidden-files: true # .terraform.lock.hcl starts with a dot
+          if-no-files-found: error
+          retention-days: 3
+
+  apply:
+    name: apply
+    needs: plan
+    if: needs.plan.outputs.has_changes == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: prod # approval gate; also the only place the apply role's trust policy allows
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        working-directory: infra/prod/${{ inputs.stack }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Download saved plan
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: tfplan-${{ inputs.stack }}
+          path: infra/prod/${{ inputs.stack }}
+
+      - name: AWS credentials (apply role)
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_APPLY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gh-apply-${{ inputs.stack }}-${{ github.run_id }}
+
+      - name: terraform init
+        run: terraform init -lockfile=readonly -input=false -no-color
+
+      # Applies exactly the reviewed plan, holding the state lock (the apply role can write .tflock).
+      # If state changed since, Terraform refuses with
+      # "Saved plan is stale" -> re-run the whole workflow to get a fresh plan.
+      - name: terraform apply
+        run: terraform apply -no-color -input=false -lock-timeout=10m tfplan

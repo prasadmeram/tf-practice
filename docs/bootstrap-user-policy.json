@@ -1,0 +1,45 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "StateBucket",
+      "Effect": "Allow",
+      "Action": "s3:*",
+      "Resource": [
+        "arn:aws:s3:::tfstate-ACCOUNT_ID-ap-south-1",
+        "arn:aws:s3:::tfstate-ACCOUNT_ID-ap-south-1/*"
+      ]
+    },
+    {
+      "Sid": "KmsCreate",
+      "Effect": "Allow",
+      "Action": ["kms:CreateKey", "kms:TagResource", "kms:ListAliases", "kms:ListKeys"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "KmsManageKeysAndAlias",
+      "Effect": "Allow",
+      "Action": "kms:*",
+      "Resource": [
+        "arn:aws:kms:ap-south-1:ACCOUNT_ID:key/*",
+        "arn:aws:kms:ap-south-1:ACCOUNT_ID:alias/terraform-state"
+      ]
+    },
+    {
+      "Sid": "CiRolesPoliciesAndGithubOidc",
+      "Effect": "Allow",
+      "Action": "iam:*",
+      "Resource": [
+        "arn:aws:iam::ACCOUNT_ID:role/ci/*",
+        "arn:aws:iam::ACCOUNT_ID:policy/ci/*",
+        "arn:aws:iam::ACCOUNT_ID:oidc-provider/token.actions.githubusercontent.com"
+      ]
+    },
+    {
+      "Sid": "IamReadForTerraform",
+      "Effect": "Allow",
+      "Action": ["iam:GetPolicy", "iam:GetPolicyVersion", "iam:ListOpenIDConnectProviders"],
+      "Resource": "*"
+    }
+  ]
+}

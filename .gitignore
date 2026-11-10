@@ -1,0 +1,20 @@
+# Terraform working dirs and state (state lives in S3)
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+
+# Saved plans and CI scratch files
+tfplan
+*.tfplan
+plan.txt
+plan.json
+plan.log
+comment.md
+
+# Only bootstrap's tfvars is private (IAM user ARN). Stack tfvars are committed.
+bootstrap/terraform.tfvars
+
+# Personal Claude Code overrides
+.claude/settings.local.json

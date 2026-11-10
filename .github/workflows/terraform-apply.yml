@@ -1,0 +1,75 @@
+name: terraform-apply
+
+on:
+  push:
+    branches: [main]
+    paths: ["infra/**"]
+  workflow_dispatch: # re-plan + apply every stack (e.g. after "Saved plan is stale")
+
+permissions: {}
+
+env:
+  TF_VERSION: 1.16.4
+
+jobs:
+  changes:
+    name: detect changed stacks
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      network: ${{ steps.detect.outputs.network }}
+      app: ${{ steps.detect.outputs.app }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - id: detect
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          all=false
+          if [ "$EVENT" != "push" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ] \
+             || ! git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+            all=true
+          else
+            files="$(git diff --name-only "$BEFORE" "$GITHUB_SHA")"
+            echo "Changed files:"; echo "$files"
+          fi
+          for s in network app; do
+            changed=false
+            if [ -d "infra/prod/$s" ] && { $all || grep -q "^infra/prod/$s/" <<<"$files"; }; then changed=true; fi
+            echo "$s=$changed" | tee -a "$GITHUB_OUTPUT"
+          done
+
+  # Network ALWAYS before app. Each stack has its own concurrency group, so two runs
+  # never touch the same state; a queued run waits instead of being cancelled.
+  network:
+    needs: changes
+    if: needs.changes.outputs.network == 'true'
+    permissions:
+      contents: read
+      id-token: write
+    concurrency:
+      group: tf-state-network
+      cancel-in-progress: false
+    uses: ./.github/workflows/_terraform-apply-stack.yml
+    with:
+      stack: network
+
+  app:
+    needs: [changes, network]
+    if: ${{ !cancelled() && needs.changes.outputs.app == 'true' && contains(fromJSON('["success","skipped"]'), needs.network.result) }}
+    permissions:
+      contents: read
+      id-token: write
+    concurrency:
+      group: tf-state-app
+      cancel-in-progress: false
+    uses: ./.github/workflows/_terraform-apply-stack.yml
+    with:
+      stack: app
